@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request
 import requests
 import re
 
@@ -12,9 +12,8 @@ def generate():
 
         match = re.search(r"NetflixId=([^;]+)", cookie)
         if not match:
-            return jsonify({"success": False, "error": "NetflixId not found"})
+            return "NetflixId not found", 400
 
-        # Your original working headers
         headers = {
             "User-Agent": "Argo/15.48.1 (iPhone; iOS 15.8.5; Scale/2.00)",
             "Cookie": f"NetflixId={match.group(1)}"
@@ -49,18 +48,18 @@ def generate():
         )
 
         if response.status_code != 200:
-            return jsonify({"success": False, "error": "Netflix error"})
+            return "Netflix error", 400
 
         json_data = response.json()
         token = (((json_data.get("value") or {}).get("account") or {}).get("token") or {}).get("default", {}).get("token")
 
         if not token:
-            return jsonify({"success": False, "error": "No token"})
+            return "No token generated", 400
 
-        return jsonify({"success": True, "token": token})
+        return token   # ← Plain text token only
 
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return str(e), 500
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=5000)
