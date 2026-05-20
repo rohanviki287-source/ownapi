@@ -1,0 +1,1 @@
+web: gunicorn nftoken_api:app
