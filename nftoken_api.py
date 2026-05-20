@@ -1,8 +1,18 @@
-from flask import Flask, request, jsonify
-import requests
+import json
+import os
 import re
+import urllib.parse
+from datetime import datetime
 
-app = Flask(__name__)
+import requests
+from urllib3.exceptions import InsecureRequestWarning
+
+INPUT_FILE = "input.txt"
+WATERMARK = (
+    "https://github.com/harshitkamboj | "
+    "website: harshitkamboj.in | "
+    "discord: https://discord.gg/DYJFE9nu5X"
+)
 
 API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
 
@@ -57,54 +67,166 @@ BASE_HEADERS = {
     "x-netflix.request.client.timezoneid": "Asia/Dhaka",
 }
 
-@app.route('/generate', methods=['POST'])
-def generate():
+COOKIE_KEYS = ("NetflixId", "SecureNetflixId", "nfvdid", "OptanonConsent")
+REQUIRED_COOKIE = "NetflixId"
+
+requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
+
+
+def ensure_input_file():
+    if not os.path.exists(INPUT_FILE):
+        with open(INPUT_FILE, "w", encoding="utf-8") as file_handle:
+            file_handle.write("NetflixId=...; SecureNetflixId=...; nfvdid=...\n")
+        print("Created input.txt")
+        print("Add your cookie in input.txt and run again")
+        return None
+
+    with open(INPUT_FILE, "r", encoding="utf-8") as file_handle:
+        content = file_handle.read().strip()
+
+    if not content:
+        print("input.txt is empty")
+        print("Add your cookie in input.txt and run again")
+        return None
+
+    return content
+
+
+def parse_netscape_cookie_line(line):
+    parts = line.strip().split("\t")
+    if len(parts) >= 7:
+        return {parts[5]: parts[6]}
+    return {}
+
+
+def _decode_cookie_value(value):
+    if isinstance(value, str) and "%" in value:
+        try:
+            return urllib.parse.unquote(value)
+        except Exception:
+            return value
+    return value
+
+
+def extract_cookie_dict(text):
+    cookie_dict = {}
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        cookie_dict.update(parse_netscape_cookie_line(line))
+
     try:
-        data = request.get_json()
-        if not data or 'cookie' not in data:
-            return jsonify({"success": False, "error": "Missing cookie field"}), 400
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = None
 
-        raw_cookie = str(data['cookie']).strip()
+    if isinstance(data, list):
+        for cookie in data:
+            name = cookie.get("name")
+            value = cookie.get("value")
+            if name in COOKIE_KEYS and isinstance(value, str):
+                cookie_dict[name] = _decode_cookie_value(value)
+    elif isinstance(data, dict):
+        if any(key in data for key in COOKIE_KEYS):
+            for key in COOKIE_KEYS:
+                value = data.get(key)
+                if isinstance(value, str):
+                    cookie_dict[key] = _decode_cookie_value(value)
+        elif isinstance(data.get("cookies"), list):
+            for cookie in data["cookies"]:
+                name = cookie.get("name")
+                value = cookie.get("value")
+                if name in COOKIE_KEYS and isinstance(value, str):
+                    cookie_dict[name] = _decode_cookie_value(value)
 
-        match = re.search(r"NetflixId=([^;]+)", raw_cookie)
-        if not match:
-            return jsonify({"success": False, "error": "NetflixId not found in cookie"}), 400
+    for key in COOKIE_KEYS:
+        if key in cookie_dict:
+            continue
+        match = re.search(rf"(?<!\w){re.escape(key)}=([^;,\s]+)", text)
+        if match:
+            cookie_dict[key] = _decode_cookie_value(match.group(1))
 
-        netflix_id = match.group(1)
+    return cookie_dict
 
-        headers = dict(BASE_HEADERS)
-        headers["Cookie"] = f"NetflixId={netflix_id}"
 
-        response = requests.get(API_URL, params=QUERY_PARAMS, headers=headers, timeout=30, verify=False)
+def build_nftoken_link(token):
+    return "https://netflix.com/?nftoken=" + token
 
-        if response.status_code != 200:
-            return jsonify({"success": False, "error": f"Netflix returned {response.status_code}"}), 400
 
-        json_data = response.json()
+def fetch_nftoken(cookie_dict):
+    netflix_id = cookie_dict.get(REQUIRED_COOKIE)
+    if not netflix_id:
+        raise ValueError("Missing required cookie: NetflixId")
 
-        token = (
-            (((json_data.get("value") or {}).get("account") or {}).get("token") or {})
-            .get("default", {})
-            .get("token")
-        )
+    headers = dict(BASE_HEADERS)
+    headers["Cookie"] = f"NetflixId={netflix_id}"
 
-        if not token:
-            return jsonify({"success": False, "error": "No token in Netflix response"}), 400
+    response = requests.get(
+        API_URL,
+        params=QUERY_PARAMS,
+        headers=headers,
+        timeout=30,
+        verify=False,
+    )
+    response.raise_for_status()
 
-        base = "https://www.netflix.com"
-        return jsonify({
-            "success": True,
-            "nftoken": token,
-            "links": {
-                "pc": f"{base}/account?nftoken={token}",
-                "phone": f"{base}/unsupported?nftoken={token}",
-                "tv": f"{base}/tv9?nftoken={token}"
-            }
-        })
+    data = response.json()
+    token_data = (
+        (((data.get("value") or {}).get("account") or {}).get("token") or {}).get("default")
+        or {}
+    )
+    token = token_data.get("token")
+    expires = token_data.get("expires")
 
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+    if not token:
+        raise ValueError("No token found in response.")
 
-if __name__ == '__main__':
-    print("NFT Token API Started")
-    app.run(host="0.0.0.0", port=5000)
+    if isinstance(expires, int) and len(str(expires)) == 13:
+        expires //= 1000
+
+    return token, expires
+
+
+def format_expiry(expires):
+    if not isinstance(expires, (int, float)):
+        return "Unknown"
+    try:
+        return datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(expires)
+
+
+def main():
+    print(WATERMARK)
+    print()
+    raw_cookie = ensure_input_file()
+    if raw_cookie is None:
+        return
+
+    cookie_dict = extract_cookie_dict(raw_cookie)
+    if not cookie_dict:
+        print("No valid cookie found in input.txt.")
+        print()
+        return
+
+    try:
+        token, expires = fetch_nftoken(cookie_dict)
+
+        print("Login URL: " + build_nftoken_link(token))
+        print()
+        print("Expires : " + format_expiry(expires))
+    except requests.RequestException as exc:
+        print("Request failed: " + str(exc))
+        print()
+    except ValueError as exc:
+        print("Failed: " + str(exc))
+        print()
+    finally:
+        print()
+        print(WATERMARK)
+
+
+if __name__ == "__main__":
+    main()
