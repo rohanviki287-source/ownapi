@@ -1,18 +1,9 @@
-import json
-import os
-import re
-import urllib.parse
+from telegram.ext import ApplicationBuilder, MessageHandler, filters
+import requests, os, re, json, urllib.parse
 from datetime import datetime
-
-import requests
 from urllib3.exceptions import InsecureRequestWarning
 
-INPUT_FILE = "input.txt"
-WATERMARK = (
-    "https://github.com/harshitkamboj | "
-    "website: harshitkamboj.in | "
-    "discord: https://discord.gg/DYJFE9nu5X"
-)
+requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
 API_URL = "https://ios.prod.ftl.netflix.com/iosui/user/15.48"
 
@@ -68,168 +59,73 @@ BASE_HEADERS = {
 }
 
 COOKIE_KEYS = ("NetflixId", "SecureNetflixId", "nfvdid", "OptanonConsent")
-REQUIRED_COOKIE = "NetflixId"
 
-requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
-
-
-def ensure_input_file():
-    if not os.path.exists(INPUT_FILE):
-        with open(INPUT_FILE, "w", encoding="utf-8") as file_handle:
-            file_handle.write("NetflixId=...; SecureNetflixId=...; nfvdid=...\n")
-        print("Created input.txt")
-        print("Add your cookie in input.txt and run again")
-        return None
-
-    with open(INPUT_FILE, "r", encoding="utf-8") as file_handle:
-        content = file_handle.read().strip()
-
-    if not content:
-        print("input.txt is empty")
-        print("Add your cookie in input.txt and run again")
-        return None
-
-    return content
-
-
-def parse_netscape_cookie_line(line):
-    parts = line.strip().split("\t")
-    if len(parts) >= 7:
-        return {parts[5]: parts[6]}
-    return {}
-
-
-def _decode_cookie_value(value):
+def decode_value(value):
     if isinstance(value, str) and "%" in value:
         try:
             return urllib.parse.unquote(value)
-        except Exception:
+        except:
             return value
     return value
 
-
 def extract_cookie_dict(text):
     cookie_dict = {}
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        cookie_dict.update(parse_netscape_cookie_line(line))
-
     try:
         data = json.loads(text)
-    except json.JSONDecodeError:
-        data = None
-
-    if isinstance(data, list):
-        for cookie in data:
-            name = cookie.get("name")
-            value = cookie.get("value")
-            if name in COOKIE_KEYS and isinstance(value, str):
-                cookie_dict[name] = _decode_cookie_value(value)
-    elif isinstance(data, dict):
-        if any(key in data for key in COOKIE_KEYS):
+        if isinstance(data, list):
+            for c in data:
+                if c.get("name") in COOKIE_KEYS:
+                    cookie_dict[c["name"]] = decode_value(c.get("value", ""))
+        elif isinstance(data, dict):
             for key in COOKIE_KEYS:
-                value = data.get(key)
-                if isinstance(value, str):
-                    cookie_dict[key] = _decode_cookie_value(value)
-        elif isinstance(data.get("cookies"), list):
-            for cookie in data["cookies"]:
-                name = cookie.get("name")
-                value = cookie.get("value")
-                if name in COOKIE_KEYS and isinstance(value, str):
-                    cookie_dict[name] = _decode_cookie_value(value)
-
+                if key in data:
+                    cookie_dict[key] = decode_value(data[key])
+    except:
+        pass
     for key in COOKIE_KEYS:
-        if key in cookie_dict:
-            continue
-        match = re.search(rf"(?<!\w){re.escape(key)}=([^;,\s]+)", text)
-        if match:
-            cookie_dict[key] = _decode_cookie_value(match.group(1))
-
+        if key not in cookie_dict:
+            match = re.search(rf"(?<!\w){re.escape(key)}=([^;,\s]+)", text)
+            if match:
+                cookie_dict[key] = decode_value(match.group(1))
     return cookie_dict
 
-
-def build_nftoken_link(token):
-    return "https://netflix.com/?nftoken=" + token
-
-
 def fetch_nftoken(cookie_dict):
-    netflix_id = cookie_dict.get(REQUIRED_COOKIE)
+    netflix_id = cookie_dict.get("NetflixId")
     if not netflix_id:
-        raise ValueError("Missing required cookie: NetflixId")
-
+        raise ValueError("Missing NetflixId in cookie")
     headers = dict(BASE_HEADERS)
     headers["Cookie"] = f"NetflixId={netflix_id}"
-
-    response = requests.get(
-        API_URL,
-        params=QUERY_PARAMS,
-        headers=headers,
-        timeout=30,
-        verify=False,
-    )
+    response = requests.get(API_URL, params=QUERY_PARAMS, headers=headers, timeout=30, verify=False)
     response.raise_for_status()
-
     data = response.json()
-    token_data = (
-        (((data.get("value") or {}).get("account") or {}).get("token") or {}).get("default")
-        or {}
-    )
+    token_data = (((data.get("value") or {}).get("account") or {}).get("token") or {}).get("default") or {}
     token = token_data.get("token")
     expires = token_data.get("expires")
-
     if not token:
-        raise ValueError("No token found in response.")
-
+        raise ValueError("No token found in response")
     if isinstance(expires, int) and len(str(expires)) == 13:
         expires //= 1000
-
     return token, expires
 
-
 def format_expiry(expires):
-    if not isinstance(expires, (int, float)):
-        return "Unknown"
     try:
         return datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
+    except:
         return str(expires)
 
-
-def main():
-    print(WATERMARK)
-    print()
-    raw_cookie = ensure_input_file()
-    if raw_cookie is None:
-        return
-
-    cookie_dict = extract_cookie_dict(raw_cookie)
-    if not cookie_dict:
-        print("No valid cookie found in input.txt.")
-        print()
-        return
-
+async def handle(update, context):
+    text = update.message.text.strip()
+    await update.message.reply_text("⏳ Processing your cookie...")
     try:
+        cookie_dict = extract_cookie_dict(text)
         token, expires = fetch_nftoken(cookie_dict)
+        login_url = "https://netflix.com/?nftoken=" + token
+        expiry = format_expiry(expires)
+        reply = f"✅ Login URL:\n{login_url}\n\n⏰ Expires: {expiry}"
+    except Exception as e:
+        reply = f"❌ Failed: {str(e)}"
+    await update.message.reply_text(reply)
 
-        print("Login URL: " + build_nftoken_link(token))
-        print()
-        print("Expires : " + format_expiry(expires))
-    except requests.RequestException as exc:
-        print("Request failed: " + str(exc))
-        print()
-    except ValueError as exc:
-        print("Failed: " + str(exc))
-        print()
-    finally:
-        print()
-        print(WATERMARK)
-
-
-except Exception as e:
-        return str(e), 500
-
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=5000)
+app = ApplicationBuilder().token(os.environ["BOT_TOKEN"]).build()
+app.add_handler(MessageHandler(filters.TEXT, handle))
+app.run_polling()
