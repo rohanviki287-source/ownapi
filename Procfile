@@ -1,1 +1,1 @@
-web: gunicorn nftoken_api:app
+worker: python main.py
